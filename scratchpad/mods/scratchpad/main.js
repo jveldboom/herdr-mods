@@ -489,11 +489,26 @@ class Pad {
     return { value: this.editor.value(), start: Math.min(range.start, range.end), end: Math.max(range.start, range.end) };
   }
 
-  onModifiers(e) {
+  onModifiers(e, cx) {
     const held = !!e.modifiers?.platform;
     if (held && !this.cmdHeld) this.armed = this.snapshot();
     this.cmdHeld = held;
-    if (!held) this.armed = null;
+    if (!held) {
+      this.armed = null;
+      this.checkSelection(cx);  // macOS sends no key-up while Cmd is held (Cmd+A)
+    }
+  }
+
+  // Cmd+A and other Cmd chords change the selection without a key-up or mouse-up.
+  // Select-all is done here too (the editor's own run is harmless, this is the
+  // same range), so the button updates in the same press with no timer. Other
+  // keys are checked straight away; releasing Cmd checks once more. Either way
+  // re-arm, so a Cmd+Enter that follows sees the new selection.
+  onKeyDown(e, cx) {
+    if (e.key === "enter") return;
+    if (e.keystroke === "cmd-a") this.editor.set_selected_range({ start: 0, end: this.editor.value().length });
+    this.checkSelection(cx);
+    if (this.cmdHeld) this.armed = this.snapshot();
   }
 
   // The editor turns Cmd+Enter into a newline over the selection. Spot that edit,
@@ -593,7 +608,7 @@ class Pad {
       .id("scratchpad")
       .key_context("ScratchPad")
       .on_action(SEND, (_e, cx) => this.trySend(cx, this.snapshot()))
-      .on_modifiers_changed((e) => this.onModifiers(e))
+      .on_modifiers_changed((e, cx) => this.onModifiers(e, cx))
       .size_full().min_h(0).rounded(10).overflow_hidden()
       .bg(t.background).border_1().border_color(t.border)
       .text_color(t.foreground).text_size(13)
@@ -609,6 +624,7 @@ class Pad {
         div().id("scratchpad-editor").relative().flex_1().min_h(0).p(8)
           .on_mouse_up("left", (_e, cx) => this.checkSelection(cx))
           .on_key_up((_e, cx) => this.checkSelection(cx))
+          .on_key_down((e, cx) => this.onKeyDown(e, cx))
           .child(Editor.new(this.editor))
           .when(this.empty, (el) => el.child(this.hint(t))),
       )
@@ -628,9 +644,10 @@ class Pad {
               // Take the selection on press, before the editor loses focus.
               .on_mouse_down("left", () => { this.pressed = this.snapshot(); })
               .on_click((_e, cx) => {
-                if (!this.hasSelection) return;
+                // Judge by the selection at press time, not the cached flag.
                 const snap = this.pressed ?? this.snapshot();
                 this.pressed = null;
+                if (snap.start === snap.end) return;
                 this.trySend(cx, snap);
               })
               .child("Send")
