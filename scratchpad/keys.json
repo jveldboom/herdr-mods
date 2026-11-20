@@ -1,0 +1,4 @@
+{
+  "layout:main-scratchpad": { "cmd-shift-j": "scratchpad.toggle" },
+  "mod:scratchpad": { "cmd-enter": "scratchpad.send" }
+}
