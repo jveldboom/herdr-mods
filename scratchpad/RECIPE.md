@@ -15,7 +15,7 @@ A markdown scratch pad for each Herdr space, in a panel that slides in to the ri
     - Highlight text, then ⌘↵ or Send to paste it into your last terminal.
     - ⌘⇧J opens and closes this panel.
     - Saved on the space's machine; cleared when the space closes.
-  - **Footer:** 8px vertical and 14px horizontal padding, a 1px top border, the Send button on the right. The button is 24px tall with 10px horizontal padding, 6px corners, a `raised` fill and a 1px `border`, and reads "Send ⌘↵" with the shortcut at 70% opacity. With no text highlighted it is disabled: `dim` text at 50% opacity, with no pointer cursor and no hover. With text highlighted it has `foreground` text and turns `hover` under the pointer.
+  - **Footer:** 8px vertical and 14px horizontal padding, 8px gap, a 1px top border. A status line on the left (empty unless a send was refused), the Send button on the right. The button is 24px tall with 10px horizontal padding, 6px corners, a `raised` fill and a 1px `border`, and reads "Send ⌘↵" with the shortcut at 70% opacity. With no text highlighted it is disabled: `dim` text at 50% opacity, with no pointer cursor and no hover. With text highlighted it has `foreground` text and turns `hover` under the pointer.
 
 ## How it behaves
 
@@ -27,16 +27,17 @@ A markdown scratch pad for each Herdr space, in a panel that slides in to the ri
 - **Open or closed per space**, like Files and Changes: each space remembers whether its pad was open, and switching spaces shows or hides the panel to match. New spaces start closed. This survives restarts.
 - **Lifetime:** pads survive closing the panel, quitting Herdr and rebooting. A pad is deleted when its space closes, including spaces that are only in "recent". Pads for spaces on a machine that isn't connected, or that hasn't listed any spaces yet, are kept until that machine reports in.
 - **Across machines:** a pad is stored on its space's machine, in that machine's own Herdr home. Any screen showing the space (this computer, another computer connected to the same machine, or the machine's own Herdr window) reads and writes the same file.
-  - Edits from another screen appear on their own: this computer's pad folder is watched, and a remote space's pad is re-read every 3 seconds while the panel shows it.
+  - Edits from another screen appear on their own: this computer's pad folder is watched, and a remote space's pad is re-read every 3 seconds while the panel shows it. Each check first fetches the file's fingerprint (sub-second mtime, size and inode, or `none`) and reads the text only when it differs from the one taken at the last read. No timer runs otherwise: a hidden copy keeps its timers, so the poll timer cancels itself on the first tick where the panel is hidden or the space is local, and the pad's render starts it again.
   - A pad with unsaved edits (typed in the last 400ms, or a failed save) isn't replaced by what's on disk. Two screens typing in the same pad at once: the last save wins.
   - A remote space opened before its machine answers shows an empty pad and the "Can't reach" note; the poll keeps retrying and loads the pad when the machine answers. Typing in the meantime isn't kept.
-  - A failed save shows one toast ("Couldn't save the pad on <machine>: …") until a save succeeds again.
+  - A failed save shows "Not saved on <machine>: …" in the header (same style as "Can't reach") until a save succeeds.
   - Pads that older versions kept on this computer for remote spaces are moved to the remote machine the first time they're opened.
 - **Sending** (Cmd+Enter or the Send button):
   - It sends only the highlighted text; there is no "send everything".
   - The text goes to the last terminal focused in the current tab. It is pasted at the prompt without pressing Enter, and focus moves to that terminal.
-  - The pad's text and selection are never changed by a send. If sending fails, a toast says why and the text is untouched.
-  - With nothing highlighted, a toast says "Highlight the text you want to send." If no terminal has been focused in the tab yet, the toast says "No terminal to send to yet: click one first."
+  - The pad's text and selection are never changed by a send. If sending fails, the footer says why and the text is untouched.
+  - With nothing highlighted, the footer says "Highlight the text you want to send." If no terminal has been focused in the tab yet, it says "No terminal to send to yet: click one first." A failed paste says "Send failed: …".
+  - **No toasts or notifications, ever.** Every message is inline: the footer status, left of Send, in `dim` 11px text, truncated with an ellipsis. Typing or switching spaces clears it.
   - The clipboard is used for the paste and its previous text is put back about half a second later. Non-text clipboard contents (images, files) are not restored.
 - **Agent statuses** (working, blocked, done, idle) are not shown; the pad doesn't track agents.
 - No animations.
@@ -56,9 +57,10 @@ A markdown scratch pad for each Herdr space, in a panel that slides in to the ri
   - The space id `vps/sp12` means space `sp12` on machine `vps`; a bare id is this computer.
   - This computer: `appHome()` and `fs/promises`, and `watchFolder(dir)` for changes.
   - Another machine: the folder is `${HERDR_APP_HOME:-$HOME/.config/herdr-app}/data/scratchpad`, resolved once per machine with `exec("sh", ["-c", …], {on: machine})`. Reads use `readTextFile(path, {on})`. Writes go through `sh -c` with `on`: `printf %s "$2" >> file.tmp` in 30,000-character pieces (never splitting a surrogate pair), then `mv -f` over the pad. Deletes use `rm -f`.
+  - The fingerprint is `stat -c "%y %s %i"` (GNU, BusyBox), falling back to `stat -f "%Fm %z %i"` (macOS, BSD); `none` when the file is missing. Whole-second mtime isn't enough: this computer's pads are written in place, so two same-length edits in one second would look unchanged.
   - Cleanup lists each ready remote machine's folder with `ls -1` and deletes pads whose `machine/id` isn't in `spaces()`, skipping names that decode to an id with a `/`.
 - **Sending:** `exec("pbpaste")` saves the clipboard text to `data/scratchpad/.clipboard`. The selection is written to `.send` and copied with `sh -c 'pbcopy < "$1"'`. Then `run("pane.focus", {terminal})`, a 60ms wait, `run("terminal.paste")`, and about 400ms later the saved clipboard is restored and both temp files deleted.
-- **Herdr functions and commands:** `appHome`, `checking`, `exec`, `focused`, `layout`, `machines`, `nextCommand`, `notify`, `props`, `readTextFile`, `run`, `settings`, `spaces`, `theme`, `watchFolder`. Commands: `layout.show`, `layout.hide`, `pane.focus`, `terminal.paste`.
+- **Herdr functions and commands:** `appHome`, `checking`, `exec`, `focused`, `layout`, `machines`, `nextCommand`, `props`, `readTextFile`, `run`, `settings`, `spaces`, `theme`, `watchFolder`. Commands: `layout.show`, `layout.hide`, `pane.focus`, `terminal.paste`.
 - **Programs:** `sh`, `pbcopy` and `pbpaste` (macOS) here; `sh`, `printf`, `mkdir`, `mv`, `rm` and `ls` on remote machines.
 
 ## Watch out
@@ -68,7 +70,8 @@ A markdown scratch pad for each Herdr space, in a panel that slides in to the ri
   - On `change` while Cmd is held, if the new value is exactly the snapshot with its selected range replaced by `\n` plus optional spaces or tabs, call `set_value` and `set_selected_range` to restore the snapshot, then send from it.
   - Other Cmd edits (paste, cut, undo) don't match that pattern and pass through.
   - The send path only reads a snapshot and never writes to the editor.
-- **The editor emits no selection events.** To enable Send only with a selection, re-check `selected_range()` on `on_mouse_up` and `on_key_up` of a wrapper div around the editor. Take the snapshot in the Send button's `on_mouse_down`, before the editor loses focus. The button can briefly look enabled after a selection is cleared some other way; clicking it then only shows the "highlight" toast.
+- **The editor emits no selection events.** To enable Send only with a selection, re-check `selected_range()` on `on_mouse_up` and `on_key_up` of a wrapper div around the editor. Take the snapshot in the Send button's `on_mouse_down`, before the editor loses focus. The button can briefly look enabled after a selection is cleared some other way; clicking it then only shows the "highlight" message in the footer.
+- **The editor's `submit` event fires on plain Enter too.** Send from it only while Cmd is held (with the snapshot taken when Cmd went down). Otherwise every Enter in the pad counts as a send attempt.
 - **`EditorState` has no placeholder option.** The empty hint is an `absolute().inset_0()` overlay with no mouse handlers, so clicks fall through to the editor. Re-render when the pad flips between empty and not.
 - **There's no command to type text into a terminal without pressing Enter.** `hc send` always presses Enter, so the clipboard route is the only one.
 - **A split pane can't be sized from code.** `pane.split` takes no size, and no command resizes a pane. That's why the pad is a layout panel and not a Cmd+D-style pane.

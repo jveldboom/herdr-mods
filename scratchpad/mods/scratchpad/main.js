@@ -14,7 +14,7 @@
 import { View, div, svg } from "gpui-kit";
 import { Editor, EditorState, h_flex, v_flex } from "gpui-base";
 import {
-  appHome, checking, exec, focused, layout, machines, nextCommand, notify, props, readTextFile,
+  appHome, checking, exec, focused, layout, machines, nextCommand, props, readTextFile,
   run, settings, spaces, theme, watchFolder,
 } from "herdr";
 import * as fs from "fs/promises";
@@ -30,8 +30,9 @@ const fileFor = (space) => `${dir()}/${encodeURIComponent(space)}.md`;
 // Shared by every copy of this mod.
 const texts = new Map();         // space id -> pad text
 const synced = new Map();        // space id -> text last read from or written to its file
+const stamps = new Map();        // remote space id -> file fingerprint when it was last read
 const lastTerminal = new Map();  // tab id -> last focused terminal address
-const state = { padFocused: false, wantFocus: false, pad: null, saveFailed: false };
+const state = { padFocused: false, wantFocus: false, pad: null, saveError: null };
 
 function find(node, id) {
   if (!node) return null;
@@ -71,6 +72,17 @@ async function remoteDir(machine) {
   return remoteDirs.get(machine);
 }
 
+const remotePath = async (machine, id) => `${await remoteDir(machine)}/${encodeURIComponent(id)}.md`;
+
+// Sub-second mtime, size and inode, or "none": cheap to fetch, and it changes on
+// any write, in place or by rename. GNU and BusyBox stat take -c, BSD and macOS -f.
+async function remoteStamp(machine, id) {
+  const out = await sh(machine,
+    'if [ -e "$1" ]; then stat -c "%y %s %i" "$1" 2>/dev/null || stat -f "%Fm %z %i" "$1"; else echo none; fi',
+    await remotePath(machine, id));
+  return out.trim();
+}
+
 async function ensureDir() {
   if (!(await fs.exists(dir()))) await fs.mkdir(dir(), { recursive: true });
 }
@@ -82,7 +94,7 @@ async function readPad(space) {
     const path = fileFor(space);
     return (await fs.exists(path)) ? await fs.readFile(path, "utf8") : "";
   }
-  const text = await readTextFile(`${await remoteDir(machine)}/${encodeURIComponent(id)}.md`, { on: machine });
+  const text = await readTextFile(await remotePath(machine, id), { on: machine });
   if (text !== null) return text;
   // Older versions kept remote spaces' pads on this computer: move one over.
   const legacy = fileFor(space);
@@ -118,7 +130,7 @@ async function writePad(space, text) {
     }
     return;
   }
-  const path = `${await remoteDir(machine)}/${encodeURIComponent(id)}.md`;
+  const path = await remotePath(machine, id);
   if (text === "") await sh(machine, 'rm -f "$1"', path);
   else await writeRemote(machine, path, text);
 }
@@ -137,13 +149,10 @@ async function saveText(space, text) {
   try {
     await writePad(space, text);
     synced.set(space, text);
-    state.saveFailed = false;
+    state.saveError = null;
   } catch (err) {
-    if (!state.saveFailed) {
-      const { machine } = whereIs(space);
-      notify({ title: "Scratch Pad", body: `Couldn't save the pad${machine ? ` on ${machine}` : ""}: ${err?.message ?? err}`, level: "error" });
-    }
-    state.saveFailed = true;
+    const { machine } = whereIs(space);
+    state.saveError = `Not saved${machine ? ` on ${machine}` : ""}: ${err?.message ?? err}`;
   }
 }
 
@@ -173,6 +182,7 @@ async function sweep(live, ready) {
         if (id.includes("/") || live.has(`${machine}/${id}`)) continue;  // its own remote pads: not ours to judge
         texts.delete(`${machine}/${id}`);
         synced.delete(`${machine}/${id}`);
+        stamps.delete(`${machine}/${id}`);
         await sh(machine, 'rm -f "$1"', `${d}/${name}`);
       }
     } catch {
@@ -345,7 +355,8 @@ class Pad {
     this.editor.on("change", (_e, cx) => this.changed(cx));
     this.editor.on("focus", () => { state.padFocused = true; });
     this.editor.on("blur", () => { state.padFocused = false; });
-    this.editor.on("submit", (_e, cx) => this.trySend(cx, this.armed));
+    // The editor submits on plain Enter too; only Cmd+Enter sends.
+    this.editor.on("submit", (_e, cx) => { if (this.cmdHeld && this.armed) this.trySend(cx, this.armed); });
     // Cmd+Enter still reaches the editor first as a newline; isCmdEnterEdit
     // undoes that. These bindings cover builds where the editor lets it through.
     cx.bind_keys([
@@ -365,7 +376,7 @@ class Pad {
     if (checking()) return;
 
     // Other screens can edit the same pad: this computer's pads are watched,
-    // another machine's are re-read every few seconds while the panel shows one.
+    // another machine's are polled (see poll()).
     cx.spawn(async (cx) => {
       await ensureDir();
       for (;;) {
@@ -374,19 +385,41 @@ class Pad {
             paths.some((p) => p === dir() || p === fileFor(this.space))) this.refresh(cx);
       }
     });
-    cx.timer.every(POLL_MS, (cx) => {
-      if (this.space && whereIs(this.space).machine && panelShown()) this.refresh(cx);
+  }
+
+  // A remote pad is re-read every few seconds, but only while the panel shows it.
+  // Hidden copies keep their timers, so the timer stops itself once it isn't
+  // needed, and render() starts it again.
+  wantsPoll() {
+    return !checking() && !!this.space && !!whereIs(this.space).machine && panelShown();
+  }
+
+  poll(cx) {
+    if (this.pollTask || !this.wantsPoll()) return;
+    this.pollTask = cx.timer.every(POLL_MS, (cx) => {
+      if (!this.wantsPoll()) {
+        this.pollTask?.cancel();
+        this.pollTask = null;
+        return;
+      }
+      this.refresh(cx);
     });
   }
 
   // Re-reads the shown pad's file and shows it, unless there are unsaved edits.
+  // A remote file is only read when its fingerprint has changed.
   refresh(cx) {
     const space = this.space;
     if (!space || this.refreshing || !isClean(space)) return;
     this.refreshing = true;
     cx.spawn(async (cx) => {
       try {
+        const { machine, id } = whereIs(space);
+        const stamp = machine ? await remoteStamp(machine, id) : null;
+        if (machine && stamp === stamps.get(space)) return;
         const text = await readPad(space);
+        // Taken before the read: a write in between just means one more read next time.
+        if (machine) stamps.set(space, stamp);
         if (text === synced.get(space) || !isClean(space)) return;
         texts.set(space, text);
         synced.set(space, text);
@@ -412,6 +445,7 @@ class Pad {
     const space = focused()?.space ?? null;
     if (!space || space === this.space) return;
     this.space = space;
+    this.status = null;
     if (texts.has(space)) {
       this.show(texts.get(space));
       this.refresh(cx);
@@ -486,6 +520,10 @@ class Pad {
     }
     const space = this.space;
     if (!texts.has(space)) return;  // not loaded yet
+    if (this.status) {
+      this.status = null;
+      cx.notify();
+    }
     const empty = this.editor.value() === "";
     if (empty !== this.empty) {
       this.empty = empty;
@@ -495,7 +533,10 @@ class Pad {
     if (checking()) return;
     this.saveTask?.cancel();
     this.saveTask = cx.timer.after(400, (cx) => {
-      cx.spawn(async () => saveText(space, texts.get(space) ?? ""));
+      cx.spawn(async (cx) => {
+        await saveText(space, texts.get(space) ?? "");
+        cx.notify();
+      });
     });
   }
 
@@ -507,28 +548,24 @@ class Pad {
     const s = snap ?? this.snapshot();
     cx.spawn(async (cx) => {
       try {
-        await this.send(s, cx);
+        this.status = await this.send(s, cx);
       } catch (err) {
-        notify({ title: "Scratch Pad", body: `Send failed: ${err?.message ?? err}`, level: "error" });
+        this.status = `Send failed: ${err?.message ?? err}`;
       }
+      cx.notify();
     });
   }
 
   // Reads the pad, never writes it: a failed send leaves the text as it was.
   async send({ value, start, end }, cx) {
     const text = value.slice(start, end);
-    if (!text.trim()) {
-      notify({ title: "Scratch Pad", body: "Highlight the text you want to send.", level: "info" });
-      return;
-    }
+    if (!text.trim()) return "Highlight the text you want to send.";
 
     const tab = focused()?.tab;
     const target = tab && lastTerminal.get(tab);
-    if (!target) {
-      notify({ title: "Scratch Pad", body: "No terminal to send to yet: click one first.", level: "warning" });
-      return;
-    }
+    if (!target) return "No terminal to send to yet: click one first.";
     await pasteInto(target, text, cx);
+    return null;
   }
 
   // Shown over an empty pad. No mouse handlers, so clicks reach the editor.
@@ -546,6 +583,7 @@ class Pad {
 
   render(cx) {
     this.follow(cx);
+    this.poll(cx);
     if (state.wantFocus && panelShown()) {
       state.wantFocus = false;
       this.focus();
@@ -563,7 +601,9 @@ class Pad {
         h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
           .child(div().font_semibold().child("Scratch Pad"))
           .when(!!this.unreachable, (el) => el.child(
-            div().text_size(11).text_color(t.dim).child(`Can't reach ${this.unreachable}: edits won't be saved`))),
+            div().text_size(11).text_color(t.dim).child(`Can't reach ${this.unreachable}: edits won't be saved`)))
+          .when(!this.unreachable && !!state.saveError, (el) => el.child(
+            div().text_size(11).text_color(t.dim).truncate().child(state.saveError))),
       )
       .child(
         div().id("scratchpad-editor").relative().flex_1().min_h(0).p(8)
@@ -573,8 +613,10 @@ class Pad {
           .when(this.empty, (el) => el.child(this.hint(t))),
       )
       .child(
-        h_flex().flex_none().px(14).py(8).items_center().justify_end()
+        h_flex().flex_none().px(14).py(8).gap(8).items_center().justify_between()
           .border_t(1).border_color(t.border).text_size(11)
+          // Why the last send didn't happen; cleared by typing or switching spaces.
+          .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(this.status ?? ""))
           .child(
             h_flex()
               .id("scratchpad-send")
