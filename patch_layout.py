@@ -10,7 +10,8 @@ the block that shows the active tab. Idempotent; backs each file up once (.bak).
 """
 import json, os, shutil, sys
 
-def load(p):
+def load(p, default=None):
+    if default is not None and not os.path.exists(p): return default
     with open(p) as f: return json.load(f)
 
 def save(p, d):
@@ -44,7 +45,7 @@ def add(layout, name, keys, modkeys):
              "children": [{"id": "scratchpad-pad", "type": "block",
                            "content": {"mod": "scratchpad", "props": {"role": "pad"}}}]})
     save(layout, L)
-    K = load(keys)
+    K = load(keys, {})
     for scope, binds in load(modkeys).items():
         scope = f"layout:{name}" if scope.startswith("layout:") else scope
         for combo, cmd in binds.items():
@@ -62,7 +63,7 @@ def remove(layout, name, keys):
     panel, pp = find(L, lambda n: n.get("id") == "scratchpad-panel")
     if panel: pp["children"].remove(panel)
     save(layout, L)
-    K = load(keys)
+    K = load(keys, {})
     K.pop(f"layout:{name}", None); K.pop("mod:scratchpad", None)
     save(keys, K)
 

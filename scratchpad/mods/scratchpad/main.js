@@ -7,13 +7,15 @@
 //   { role: "pad" }    — the pad itself, in the layout node PANEL. Shows the focused
 //     space's text and handles `scratchpad.send`.
 //
-// Pads are stored in data/scratchpad/<space>.md and deleted when the space closes.
+// A pad is stored on its space's machine, in that machine's
+// <Herdr home>/data/scratchpad/<space>.md, so every screen connected to the
+// machine shares it. Deleted when the space closes.
 
 import { View, div, svg } from "gpui-kit";
 import { Editor, EditorState, h_flex, v_flex } from "gpui-base";
 import {
-  appHome, checking, exec, focused, layout, machines, nextCommand, notify, props, run,
-  settings, spaces, theme,
+  appHome, checking, exec, focused, layout, machines, nextCommand, notify, props, readTextFile,
+  run, settings, spaces, theme, watchFolder,
 } from "herdr";
 import * as fs from "fs/promises";
 
@@ -21,13 +23,15 @@ const MOD = "scratchpad";
 const PANEL = "scratchpad-panel";
 const ICON = `mods/${MOD}/pad.svg`;
 const SEND = "scratchpad_send";
+const POLL_MS = 3000;
 const dir = () => `${appHome()}/data/${MOD}`;
 const fileFor = (space) => `${dir()}/${encodeURIComponent(space)}.md`;
 
 // Shared by every copy of this mod.
 const texts = new Map();         // space id -> pad text
+const synced = new Map();        // space id -> text last read from or written to its file
 const lastTerminal = new Map();  // tab id -> last focused terminal address
-const state = { padFocused: false, wantFocus: false, pad: null };
+const state = { padFocused: false, wantFocus: false, pad: null, saveFailed: false };
 
 function find(node, id) {
   if (!node) return null;
@@ -44,24 +48,136 @@ const panelShown = () => {
   return !!n && !n.hidden;
 };
 
+// "vps/sp12" is space "sp12" on machine "vps"; a bare id is on this computer.
+function whereIs(space) {
+  const i = space.indexOf("/");
+  return i < 0 ? { machine: null, id: space } : { machine: space.slice(0, i), id: space.slice(i + 1) };
+}
+
+async function sh(machine, script, ...args) {
+  const r = await exec("sh", ["-c", script, "sh", ...args], { on: machine, timeout: 15000 });
+  if (r.code !== 0) throw new Error(r.stderr.trim() || `exit ${r.code}`);
+  return r.stdout;
+}
+
+// The pad folder in another machine's Herdr home, which its own window uses too.
+const remoteDirs = new Map();
+async function remoteDir(machine) {
+  if (!remoteDirs.has(machine)) {
+    const d = await sh(machine, 'printf %s "${HERDR_APP_HOME:-$HOME/.config/herdr-app}/data/scratchpad"');
+    if (!d.startsWith("/")) throw new Error(`unexpected Herdr home on ${machine}: ${d}`);
+    remoteDirs.set(machine, d);
+  }
+  return remoteDirs.get(machine);
+}
+
 async function ensureDir() {
   if (!(await fs.exists(dir()))) await fs.mkdir(dir(), { recursive: true });
 }
 
+// Reads a pad's file: "" when there is none.
+async function readPad(space) {
+  const { machine, id } = whereIs(space);
+  if (!machine) {
+    const path = fileFor(space);
+    return (await fs.exists(path)) ? await fs.readFile(path, "utf8") : "";
+  }
+  const text = await readTextFile(`${await remoteDir(machine)}/${encodeURIComponent(id)}.md`, { on: machine });
+  if (text !== null) return text;
+  // Older versions kept remote spaces' pads on this computer: move one over.
+  const legacy = fileFor(space);
+  if (!(await fs.exists(legacy))) return "";
+  const old = await fs.readFile(legacy, "utf8");
+  await writePad(space, old);
+  await fs.unlink(legacy);
+  return old;
+}
+
+// exec passes text as an argument; Linux caps one at 128 KiB, so write in pieces.
+const CHUNK = 30000;
+async function writeRemote(machine, path, text) {
+  const tmp = `${path}.tmp`;
+  await sh(machine, 'mkdir -p "$(dirname "$1")" && : > "$1"', tmp);
+  for (let i = 0; i < text.length;) {
+    let end = Math.min(i + CHUNK, text.length);
+    if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1])) end--;  // keep surrogate pairs whole
+    await sh(machine, 'printf %s "$2" >> "$1"', tmp, text.slice(i, end));
+    i = end;
+  }
+  await sh(machine, 'mv -f "$1" "$2"', tmp, path);
+}
+
+async function writePad(space, text) {
+  const { machine, id } = whereIs(space);
+  if (!machine) {
+    await ensureDir();
+    if (text === "") {
+      if (await fs.exists(fileFor(space))) await fs.unlink(fileFor(space));
+    } else {
+      await fs.writeFile(fileFor(space), text);
+    }
+    return;
+  }
+  const path = `${await remoteDir(machine)}/${encodeURIComponent(id)}.md`;
+  if (text === "") await sh(machine, 'rm -f "$1"', path);
+  else await writeRemote(machine, path, text);
+}
+
 async function loadText(space) {
   if (texts.has(space)) return texts.get(space);
-  const path = fileFor(space);
-  const text = (await fs.exists(path)) ? await fs.readFile(path, "utf8") : "";
-  if (!texts.has(space)) texts.set(space, text);
+  const text = await readPad(space);
+  if (!texts.has(space)) {
+    texts.set(space, text);
+    synced.set(space, text);
+  }
   return texts.get(space);
 }
 
 async function saveText(space, text) {
-  await ensureDir();
-  if (text === "") {
-    if (await fs.exists(fileFor(space))) await fs.unlink(fileFor(space));
-  } else {
-    await fs.writeFile(fileFor(space), text);
+  try {
+    await writePad(space, text);
+    synced.set(space, text);
+    state.saveFailed = false;
+  } catch (err) {
+    if (!state.saveFailed) {
+      const { machine } = whereIs(space);
+      notify({ title: "Scratch Pad", body: `Couldn't save the pad${machine ? ` on ${machine}` : ""}: ${err?.message ?? err}`, level: "error" });
+    }
+    state.saveFailed = true;
+  }
+}
+
+// True when the pad has no edits that haven't been saved yet.
+const isClean = (space) => !texts.has(space) || texts.get(space) === synced.get(space);
+
+// Deletes pad files whose space has closed on a machine that reports its spaces.
+async function sweep(live, ready) {
+  if (await fs.exists(dir())) {
+    for (const name of await fs.readdir(dir())) {
+      if (!name.endsWith(".md")) continue;
+      const space = decodeURIComponent(name.slice(0, -3));
+      if (live.has(space) || !ready.has(whereIs(space).machine ?? "")) continue;
+      texts.delete(space);
+      synced.delete(space);
+      await fs.unlink(`${dir()}/${name}`);
+    }
+  }
+  for (const machine of ready) {
+    if (!machine) continue;
+    try {
+      const d = await remoteDir(machine);
+      const names = (await sh(machine, 'cd "$1" 2>/dev/null && ls -1 || true', d)).split("\n");
+      for (const name of names) {
+        if (!name.endsWith(".md")) continue;
+        const id = decodeURIComponent(name.slice(0, -3));
+        if (id.includes("/") || live.has(`${machine}/${id}`)) continue;  // its own remote pads: not ours to judge
+        texts.delete(`${machine}/${id}`);
+        synced.delete(`${machine}/${id}`);
+        await sh(machine, 'rm -f "$1"', `${d}/${name}`);
+      }
+    } catch {
+      // Unreachable now; the next change in spaces tries again.
+    }
   }
 }
 
@@ -163,22 +279,14 @@ class Button {
     if (key === this.knownSpaces || checking()) return;
     this.knownSpaces = key;
     const live = new Set(spaces().map((s) => s.id));
+    // A machine with no spaces yet may still be loading: leave its pads alone.
+    for (const m of [...ready]) if (!spaces().some((s) => (s.machine ?? "") === m)) ready.delete(m);
     const gone = Object.keys(this.open).filter((id) => !live.has(id) && ready.has(id.includes("/") ? id.split("/")[0] : ""));
     if (gone.length) {
       for (const id of gone) delete this.open[id];
       this.saveOpen();
     }
-    cx.spawn(async () => {
-      if (!(await fs.exists(dir()))) return;
-      for (const name of await fs.readdir(dir())) {
-        if (!name.endsWith(".md")) continue;
-        const space = decodeURIComponent(name.slice(0, -3));
-        const machine = space.includes("/") ? space.split("/")[0] : "";
-        if (live.has(space) || !ready.has(machine)) continue;
-        texts.delete(space);
-        await fs.unlink(`${dir()}/${name}`);
-      }
-    });
+    cx.spawn(async () => sweep(live, ready));
   }
 
   render(cx) {
@@ -254,6 +362,45 @@ class Pad {
         cx.notify();
       }
     });
+    if (checking()) return;
+
+    // Other screens can edit the same pad: this computer's pads are watched,
+    // another machine's are re-read every few seconds while the panel shows one.
+    cx.spawn(async (cx) => {
+      await ensureDir();
+      for (;;) {
+        const paths = await watchFolder(dir());
+        if (this.space && !whereIs(this.space).machine &&
+            paths.some((p) => p === dir() || p === fileFor(this.space))) this.refresh(cx);
+      }
+    });
+    cx.timer.every(POLL_MS, (cx) => {
+      if (this.space && whereIs(this.space).machine && panelShown()) this.refresh(cx);
+    });
+  }
+
+  // Re-reads the shown pad's file and shows it, unless there are unsaved edits.
+  refresh(cx) {
+    const space = this.space;
+    if (!space || this.refreshing || !isClean(space)) return;
+    this.refreshing = true;
+    cx.spawn(async (cx) => {
+      try {
+        const text = await readPad(space);
+        if (text === synced.get(space) || !isClean(space)) return;
+        texts.set(space, text);
+        synced.set(space, text);
+        if (this.space === space) {
+          this.unreachable = null;
+          this.show(text);
+        }
+        cx.notify();
+      } catch {
+        // Unreachable for now; keep showing what we have.
+      } finally {
+        this.refreshing = false;
+      }
+    });
   }
 
   focus() {
@@ -265,15 +412,22 @@ class Pad {
     const space = focused()?.space ?? null;
     if (!space || space === this.space) return;
     this.space = space;
-    // An empty cached pad may have been written outside Herdr since; read the file again.
-    if (texts.get(space) === "") texts.delete(space);
     if (texts.has(space)) {
       this.show(texts.get(space));
+      this.refresh(cx);
       return;
     }
+    // Until it loads, show nothing rather than the last space's text.
+    this.show("");
+    this.unreachable = null;
     cx.spawn(async (cx) => {
-      const text = await loadText(space);
-      if (this.space === space) this.show(text);
+      try {
+        const text = await loadText(space);
+        if (this.space === space) this.show(text);
+      } catch {
+        // The poll keeps retrying; until then edits aren't kept.
+        if (this.space === space) this.unreachable = whereIs(space).machine ?? "this computer";
+      }
       cx.notify();
     });
   }
@@ -331,6 +485,7 @@ class Pad {
       return;
     }
     const space = this.space;
+    if (!texts.has(space)) return;  // not loaded yet
     const empty = this.editor.value() === "";
     if (empty !== this.empty) {
       this.empty = empty;
@@ -386,7 +541,7 @@ class Pad {
       .child(div().text_color(t.muted).child("Scratch notes for this space."))
       .child(line("Highlight text, then ⌘↵ or Send to paste it into your last terminal."))
       .child(line("⌘⇧J opens and closes this panel."))
-      .child(line("Cleared when the space closes."));
+      .child(line("Saved on the space's machine; cleared when the space closes."));
   }
 
   render(cx) {
@@ -406,7 +561,9 @@ class Pad {
       .text_color(t.foreground).text_size(13)
       .child(
         h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
-          .child(div().font_semibold().child("Scratch Pad")),
+          .child(div().font_semibold().child("Scratch Pad"))
+          .when(!!this.unreachable, (el) => el.child(
+            div().text_size(11).text_color(t.dim).child(`Can't reach ${this.unreachable}: edits won't be saved`))),
       )
       .child(
         div().id("scratchpad-editor").relative().flex_1().min_h(0).p(8)
