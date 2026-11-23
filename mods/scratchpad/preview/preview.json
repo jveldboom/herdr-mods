@@ -1,0 +1,17 @@
+{
+  "title": ["Scratch", "Pad"],
+  "bullets": [
+    "A markdown pad for each space",
+    "Saved as you type",
+    "⌘↵ pastes the highlighted text",
+    "Screenshots and images too",
+    "Never presses Enter for you",
+    "Stays on this computer"
+  ],
+  "screenshot": "screenshot.png",
+  "crop": [
+    [252, 100, 1040, 186],
+    [252, 270, 1040, 1158],
+    [252, 1830, 1040, 1940]
+  ]
+}

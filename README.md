@@ -33,9 +33,38 @@ mods/<name>/
   src/              the mod itself; copied to Herdr's mods/<name>/
   keys.json         optional key bindings to merge
   hooks/install.sh  optional; runs in place of the default install steps
+  preview/          preview.json and the screenshot behind preview.png
+  preview.png       rendered by tools/preview/render.py
+tools/preview/      the preview renderer and its shared template
 ```
 
 To add a mod, create `mods/<name>/src/` with its `mod.json` and code. A `keys.json` next to `src/` is merged on install. If the mod needs more, such as layout changes, add `hooks/install.sh`. The repo's `install.sh` sources it with `$home`, `$mod` and `$dest` set, and the `copy_mod`, `remove_mod`, `add_keys` and `remove_keys` helpers available.
+
+## Preview images
+
+Every mod's `preview.png` uses the same layout: a 1920×1080 dark card with a soft gradient at the top and bottom, the mod's name and a few short bullets on the left, and a screenshot of the mod on the right. Don't edit the PNG by hand; render it:
+
+```sh
+tools/preview/render.py mods/<name>
+```
+
+The renderer reads `mods/<name>/preview/preview.json` and writes `mods/<name>/preview.png`:
+
+```json
+{
+  "title": ["Scratch", "Pad"],
+  "bullets": ["A markdown pad for each space", "Saved as you type"],
+  "screenshot": "screenshot.png",
+  "crop": [[252, 100, 1040, 1200], [252, 1830, 1040, 1940]]
+}
+```
+
+- `title`: one entry per line of the big heading.
+- `bullets`: about six short phrases.
+- `screenshot`: a full-resolution (Retina) macOS screenshot of the mod in Herdr, saved next to `preview.json`.
+- `crop`: rectangles in screenshot pixels, `[left, top, right, bottom]`, stacked top to bottom. Use one rectangle for the whole panel, or several of the same width to cut out empty space. Include the panel's own border.
+
+The shared style lives in `tools/preview/template.html`: fonts, sizes, colors, and the gradient (from `gray-800` at the top through `#0f0f0f` to `gray-900` at the bottom). Change it there so every mod's preview changes together, then re-render each mod. Rendering needs Google Chrome; set `CHROME` to use another Chromium binary.
 
 ## Releases
 
