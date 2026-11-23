@@ -1,0 +1,33 @@
+---
+name: release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: jveldboom/action-conventional-versioning@v1
+        id: version
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version-with-prefix }}
+          PREVIOUS: ${{ steps.version.outputs.previous-version-with-prefix }}
+        run: |
+          set -- "$VERSION" --target "$GITHUB_SHA" --generate-notes
+          if git rev-parse -q --verify "refs/tags/$PREVIOUS" >/dev/null; then
+            set -- "$@" --notes-start-tag "$PREVIOUS"
+          fi
+          gh release create "$@"
