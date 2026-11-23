@@ -53,6 +53,13 @@ table in the root `README.md`.
   changes; avoid running install/remove during checks because those modify the
   user's Herdr configuration.
 
+## Branches and pull requests
+
+Never push directly to `main`. Make every change on a branch, push the branch,
+and open a pull request against `main`. Each merge to `main` creates a release,
+so the PR title should be a Conventional Commit too (it becomes the squash
+commit).
+
 ## Commit messages
 
 Use Conventional Commits for all commit messages, following this format:
