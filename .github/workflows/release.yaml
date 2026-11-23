@@ -14,8 +14,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
 
       - uses: jveldboom/action-conventional-versioning@v1
         id: version
@@ -23,11 +21,16 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.version.outputs.version-with-prefix }}
-          PREVIOUS: ${{ steps.version.outputs.previous-version-with-prefix }}
         run: |
-          set -- "$VERSION" --target "$GITHUB_SHA" --generate-notes
-          if git rev-parse -q --verify "refs/tags/$PREVIOUS" >/dev/null; then
-            set -- "$@" --notes-start-tag "$PREVIOUS"
-          fi
-          gh release create "$@"
+          gh release create "${{ steps.version.outputs.version-with-prefix }}" \
+            --generate-notes \
+            --notes-start-tag "${{ steps.version.outputs.previous-version-with-prefix }}"
+
+      - name: Update Major Tag
+        env:
+          MAJOR: ${{ steps.version.outputs.major-with-prefix }}
+        run: |
+          git tag -d ${MAJOR} || true
+          git push origin :refs/tags/${MAJOR} || true
+          git tag ${MAJOR} ${GITHUB_SHA}
+          git push origin ${MAJOR}
