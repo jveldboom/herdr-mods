@@ -1,15 +1,16 @@
 # Project guide
 
 This repository contains mods for Herdr, a terminal app. The current mod is
-Scratch Pad: a per-space Markdown notepad that can paste selected text into the
-last focused terminal.
+Scratch Pad: a per-space Markdown notepad that can paste selected text and
+images into the last focused terminal.
 
 ## Where things live
 
 - `README.md`: user-facing overview, install/use instructions, requirements.
 - `scratchpad/RECIPE.md`: detailed behavior, implementation notes, pitfalls,
   and the acceptance checklist. Read this before changing the mod.
-- `scratchpad/mods/scratchpad/`: mod source (`main.js`, `mod.json`, and assets).
+- `scratchpad/mods/scratchpad/`: mod source (`main.js`, `clipboard.js`,
+  `mod.json`, and assets).
 - `scratchpad/keys.json`: key bindings merged during installation.
 - `install.sh` and `patch_layout.py`: install/remove the mod and wire it into a
   Herdr layout. The installer changes files under the Herdr config directory;
@@ -19,8 +20,9 @@ last focused terminal.
 
 - The mod uses Herdr's JavaScript mod API, not a standalone app framework.
   Preserve Herdr-specific behaviors and APIs described in the recipe.
-- Sending uses macOS `pbcopy`/`pbpaste` and Cmd-based shortcuts. Remote-space
-  file operations use POSIX `sh`; don't assume remote machines are macOS.
+- Clipboard and image handling use macOS `osascript` with AppKit
+  (`clipboard.js`), and the shortcuts are Cmd-based. Pads and images are stored
+  only on this computer; nothing runs on remote machines.
 - Keep the installer idempotent and preserve its backup and `--remove`
   behavior when changing layout integration.
 - Validate mod changes with `herdr-app check scratchpad/mods/scratchpad` when

@@ -7,30 +7,45 @@
 //   { role: "pad" }    — the pad itself, in the layout node PANEL. Shows the focused
 //     space's text and handles `scratchpad.send`.
 //
-// A pad is stored on its space's machine, in that machine's
-// <Herdr home>/data/scratchpad/<space>.md, so every screen connected to the
-// machine shares it. Deleted when the space closes.
+// Every pad is stored on this computer, in <Herdr home>/data/scratchpad/<space>.md,
+// with its images in <space>.images/. Pads and images for remote spaces stay here
+// too; sending pastes them into the terminal, and Herdr copies images over.
+// Deleted when the space closes.
 
-import { View, div, svg } from "gpui-kit";
+import { View, div, image, svg } from "gpui-kit";
 import { Editor, EditorState, h_flex, v_flex } from "gpui-base";
 import {
-  appHome, checking, exec, focused, layout, machines, nextCommand, props, readTextFile,
+  appHome, checking, closeOverlay, exec, focused, layout, machines, nextCommand, openOverlay, props,
   run, settings, spaces, theme, watchFolder,
 } from "herdr";
 import * as fs from "fs/promises";
+import { clipboard } from "./clipboard.js";
 
 const MOD = "scratchpad";
 const PANEL = "scratchpad-panel";
 const ICON = `mods/${MOD}/pad.svg`;
 const SEND = "scratchpad_send";
-const POLL_MS = 3000;
 const dir = () => `${appHome()}/data/${MOD}`;
 const fileFor = (space) => `${dir()}/${encodeURIComponent(space)}.md`;
+const imageFolder = (space) => `${encodeURIComponent(space)}.images`;
+const imageName = /^[a-f0-9]{32}\.png$/;
+const incoming = new Set();  // images moved into place but not referenced yet
+let sending = false;
+
+// The pad's own image references, in order, as ranges of the text.
+function imageRefs(text, space) {
+  const refs = [];
+  const prefix = `${imageFolder(space)}/`;
+  for (const match of text.matchAll(/!\[[^\]\n]*\]\(([^)\n]+)\)/g)) {
+    if (match[1].startsWith(prefix) && imageName.test(match[1].slice(prefix.length)))
+      refs.push({ path: match[1], start: match.index, end: match.index + match[0].length });
+  }
+  return refs;
+}
 
 // Shared by every copy of this mod.
 const texts = new Map();         // space id -> pad text
 const synced = new Map();        // space id -> text last read from or written to its file
-const stamps = new Map();        // remote space id -> file fingerprint when it was last read
 const lastTerminal = new Map();  // tab id -> last focused terminal address
 const state = { padFocused: false, wantFocus: false, pad: null, saveError: null };
 
@@ -50,37 +65,12 @@ const panelShown = () => {
 };
 
 // "vps/sp12" is space "sp12" on machine "vps"; a bare id is on this computer.
-function whereIs(space) {
-  const i = space.indexOf("/");
-  return i < 0 ? { machine: null, id: space } : { machine: space.slice(0, i), id: space.slice(i + 1) };
-}
+const machineOf = (space) => (space.includes("/") ? space.slice(0, space.indexOf("/")) : "");
 
-async function sh(machine, script, ...args) {
-  const r = await exec("sh", ["-c", script, "sh", ...args], { on: machine, timeout: 15000 });
+async function sh(script, ...args) {
+  const r = await exec("sh", ["-c", script, "sh", ...args], { timeout: 15000 });
   if (r.code !== 0) throw new Error(r.stderr.trim() || `exit ${r.code}`);
   return r.stdout;
-}
-
-// The pad folder in another machine's Herdr home, which its own window uses too.
-const remoteDirs = new Map();
-async function remoteDir(machine) {
-  if (!remoteDirs.has(machine)) {
-    const d = await sh(machine, 'printf %s "${HERDR_APP_HOME:-$HOME/.config/herdr-app}/data/scratchpad"');
-    if (!d.startsWith("/")) throw new Error(`unexpected Herdr home on ${machine}: ${d}`);
-    remoteDirs.set(machine, d);
-  }
-  return remoteDirs.get(machine);
-}
-
-const remotePath = async (machine, id) => `${await remoteDir(machine)}/${encodeURIComponent(id)}.md`;
-
-// Sub-second mtime, size and inode, or "none": cheap to fetch, and it changes on
-// any write, in place or by rename. GNU and BusyBox stat take -c, BSD and macOS -f.
-async function remoteStamp(machine, id) {
-  const out = await sh(machine,
-    'if [ -e "$1" ]; then stat -c "%y %s %i" "$1" 2>/dev/null || stat -f "%Fm %z %i" "$1"; else echo none; fi',
-    await remotePath(machine, id));
-  return out.trim();
 }
 
 async function ensureDir() {
@@ -89,50 +79,25 @@ async function ensureDir() {
 
 // Reads a pad's file: "" when there is none.
 async function readPad(space) {
-  const { machine, id } = whereIs(space);
-  if (!machine) {
-    const path = fileFor(space);
-    return (await fs.exists(path)) ? await fs.readFile(path, "utf8") : "";
-  }
-  const text = await readTextFile(await remotePath(machine, id), { on: machine });
-  if (text !== null) return text;
-  // Older versions kept remote spaces' pads on this computer: move one over.
-  const legacy = fileFor(space);
-  if (!(await fs.exists(legacy))) return "";
-  const old = await fs.readFile(legacy, "utf8");
-  await writePad(space, old);
-  await fs.unlink(legacy);
-  return old;
-}
-
-// exec passes text as an argument; Linux caps one at 128 KiB, so write in pieces.
-const CHUNK = 30000;
-async function writeRemote(machine, path, text) {
-  const tmp = `${path}.tmp`;
-  await sh(machine, 'mkdir -p "$(dirname "$1")" && : > "$1"', tmp);
-  for (let i = 0; i < text.length;) {
-    let end = Math.min(i + CHUNK, text.length);
-    if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1])) end--;  // keep surrogate pairs whole
-    await sh(machine, 'printf %s "$2" >> "$1"', tmp, text.slice(i, end));
-    i = end;
-  }
-  await sh(machine, 'mv -f "$1" "$2"', tmp, path);
+  const path = fileFor(space);
+  return (await fs.exists(path)) ? await fs.readFile(path, "utf8") : "";
 }
 
 async function writePad(space, text) {
-  const { machine, id } = whereIs(space);
-  if (!machine) {
-    await ensureDir();
-    if (text === "") {
-      if (await fs.exists(fileFor(space))) await fs.unlink(fileFor(space));
-    } else {
-      await fs.writeFile(fileFor(space), text);
-    }
-    return;
+  await ensureDir();
+  if (text !== "") await fs.writeFile(fileFor(space), text);
+  else if (await fs.exists(fileFor(space))) await fs.unlink(fileFor(space));
+}
+
+// Deletes the space's images that its latest text no longer references.
+async function removeImages(space) {
+  const folder = `${dir()}/${imageFolder(space)}`;
+  if (!(await fs.exists(folder))) return;
+  const kept = new Set(imageRefs(texts.get(space) ?? "", space).map((ref) => ref.path));
+  for (const name of await fs.readdir(folder)) {
+    const path = `${imageFolder(space)}/${name}`;
+    if (imageName.test(name) && !kept.has(path) && !incoming.has(path)) await fs.unlink(`${folder}/${name}`);
   }
-  const path = await remotePath(machine, id);
-  if (text === "") await sh(machine, 'rm -f "$1"', path);
-  else await writeRemote(machine, path, text);
 }
 
 async function loadText(space) {
@@ -146,82 +111,86 @@ async function loadText(space) {
 }
 
 async function saveText(space, text) {
+  if (!spaces().some((s) => s.id === space)) return;  // closed: sweep() has its files
   try {
     await writePad(space, text);
     synced.set(space, text);
     state.saveError = null;
   } catch (err) {
-    const { machine } = whereIs(space);
-    state.saveError = `Not saved${machine ? ` on ${machine}` : ""}: ${err?.message ?? err}`;
+    state.saveError = `Not saved: ${err?.message ?? err}`;
+    return;
+  }
+  try {
+    await removeImages(space);
+  } catch (err) {
+    state.saveError = `Saved, but image cleanup failed: ${err?.message ?? err}`;
   }
 }
 
 // True when the pad has no edits that haven't been saved yet.
 const isClean = (space) => !texts.has(space) || texts.get(space) === synced.get(space);
 
-// Deletes pad files whose space has closed on a machine that reports its spaces.
+// Deletes pads and images whose space has closed on a machine that reports its spaces.
 async function sweep(live, ready) {
-  if (await fs.exists(dir())) {
-    for (const name of await fs.readdir(dir())) {
-      if (!name.endsWith(".md")) continue;
-      const space = decodeURIComponent(name.slice(0, -3));
-      if (live.has(space) || !ready.has(whereIs(space).machine ?? "")) continue;
-      texts.delete(space);
-      synced.delete(space);
-      await fs.unlink(`${dir()}/${name}`);
-    }
-  }
-  for (const machine of ready) {
-    if (!machine) continue;
-    try {
-      const d = await remoteDir(machine);
-      const names = (await sh(machine, 'cd "$1" 2>/dev/null && ls -1 || true', d)).split("\n");
-      for (const name of names) {
-        if (!name.endsWith(".md")) continue;
-        const id = decodeURIComponent(name.slice(0, -3));
-        if (id.includes("/") || live.has(`${machine}/${id}`)) continue;  // its own remote pads: not ours to judge
-        texts.delete(`${machine}/${id}`);
-        synced.delete(`${machine}/${id}`);
-        stamps.delete(`${machine}/${id}`);
-        await sh(machine, 'rm -f "$1"', `${d}/${name}`);
-      }
-    } catch {
-      // Unreachable now; the next change in spaces tries again.
-    }
+  if (!(await fs.exists(dir()))) return;
+  for (const name of await fs.readdir(dir())) {
+    const suffix = name.endsWith(".md") ? ".md" : name.endsWith(".images") ? ".images" : null;
+    if (!suffix) continue;
+    const space = decodeURIComponent(name.slice(0, -suffix.length));
+    if (live.has(space) || !ready.has(machineOf(space))) continue;
+    texts.delete(space);
+    synced.delete(space);
+    await sh('rm -rf "$1"', `${dir()}/${name}`);
   }
 }
 
-// Puts text on the clipboard, pastes it into a terminal without pressing Enter,
-// then restores the previous clipboard text.
-async function pasteInto(terminal, text, cx) {
-  await ensureDir();
-  const tmp = `${dir()}/.send`;
-  const saved = `${dir()}/.clipboard`;
-  const copy = (path) => exec("sh", ["-c", 'pbcopy < "$1"', "sh", path]);
-  const before = await exec("pbpaste", []);
-  await fs.writeFile(saved, before.stdout ?? "");
-  await fs.writeFile(tmp, text);
-  const r = await copy(tmp);
-  if (r.code !== 0) throw new Error(`pbcopy failed: ${r.stderr}`);
-  run("pane.focus", { terminal });
-  cx.timer.after(60, (cx) => {
-    run("terminal.paste");
-    cx.timer.after(400, (cx) => {
-      cx.spawn(async () => {
-        await copy(saved);
-        await fs.unlink(tmp);
-        await fs.unlink(saved);
-      });
+// Paste each selected text/image part without Enter, then restore all clipboard
+// formats. One send at a time keeps clipboard saves and restores from racing.
+async function pasteInto(terminal, parts, cx) {
+  if (sending) throw new Error("A paste is already in progress.");
+  sending = true;
+  let tmp, saved, count;
+  const wait = (ms, action = () => {}) => new Promise((resolve, reject) => {
+    cx.timer.after(ms, (cx) => {
+      try { action(cx); resolve(); } catch (err) { reject(err); }
     });
   });
+  try {
+    await ensureDir();
+    tmp = (await sh('umask 077; mktemp -d "$1/.send-XXXXXX"', dir())).trim();
+    saved = `${tmp}/clipboard.json`;
+    count = await clipboard("save", saved);
+    for (const part of parts) {
+      let path = `${tmp}/payload`;
+      if (part.image) path = `${dir()}/${part.image}`;
+      else await fs.writeFile(path, part.text);
+      if (await clipboard("count") !== count) throw new Error("Clipboard changed during send; paste stopped.");
+      count = await clipboard(part.image ? "image" : "text", path, count, saved);
+      run("pane.focus", { terminal });
+      await wait(60, () => run("terminal.paste"));
+      await wait(400);
+    }
+  } finally {
+    try {
+      if (saved && count !== undefined) await clipboard("restore", saved, count);
+    } finally {
+      try {
+        if (tmp) await sh('rm -rf "$1"', tmp);
+      } finally {
+        sending = false;
+      }
+    }
+  }
 }
 
-function toggle() {
+// Cmd+Shift+J opens the pad, then focuses it, then closes it. The button just
+// opens or closes it (pass hide: true).
+function toggle({ hide = state.padFocused } = {}) {
   const f = focused();
   if (!panelShown()) {
     state.wantFocus = true;
     run("layout.show", { id: PANEL });
-  } else if (state.padFocused) {
+  } else if (hide) {
     run("layout.hide", { id: PANEL });
     const t = f?.tab && lastTerminal.get(f.tab);
     if (t) run("pane.focus", { terminal: t });
@@ -233,6 +202,7 @@ function toggle() {
 class Button {
   constructor() {
     this.knownSpaces = "";
+    this.listedMachines = new Set();
     this.lastSpace = null;
     this.pending = null;  // panel state asked for on a space switch, not yet applied
     try { this.open = JSON.parse(localStorage.getItem("open") ?? "{}") ?? {}; } catch { this.open = {}; }
@@ -290,7 +260,10 @@ class Button {
     this.knownSpaces = key;
     const live = new Set(spaces().map((s) => s.id));
     // A machine with no spaces yet may still be loading: leave its pads alone.
-    for (const m of [...ready]) if (!spaces().some((s) => (s.machine ?? "") === m)) ready.delete(m);
+    // Once it has listed spaces, an empty list means its last space closed.
+    for (const m of this.listedMachines) if (!ready.has(m)) this.listedMachines.delete(m);
+    for (const s of spaces()) if (ready.has(s.machine ?? "")) this.listedMachines.add(s.machine ?? "");
+    for (const m of [...ready]) if (!this.listedMachines.has(m)) ready.delete(m);
     const gone = Object.keys(this.open).filter((id) => !live.has(id) && ready.has(id.includes("/") ? id.split("/")[0] : ""));
     if (gone.length) {
       for (const id of gone) delete this.open[id];
@@ -318,7 +291,7 @@ class Button {
           .bg(on ? t.selected : t.chrome)
           .text_color(on ? t.foreground : t.muted)
           .hover((s) => s.bg(t.hover))
-          .on_click(() => toggle())
+          .on_click(() => toggle({ hide: true }))
           .child(svg(ICON).size(14))
           .child("Pad"),
       );
@@ -357,6 +330,7 @@ class Pad {
     this.editor.on("blur", () => { state.padFocused = false; });
     // The editor submits on plain Enter too; only Cmd+Enter sends.
     this.editor.on("submit", (_e, cx) => { if (this.cmdHeld && this.armed) this.trySend(cx, this.armed); });
+    this.editor.on("paste_other", (_e, cx) => this.addImages([null], cx));
     // Cmd+Enter still reaches the editor first as a newline; isCmdEnterEdit
     // undoes that. These bindings cover builds where the editor lets it through.
     cx.bind_keys([
@@ -375,61 +349,31 @@ class Pad {
     });
     if (checking()) return;
 
-    // Other screens can edit the same pad: this computer's pads are watched,
-    // another machine's are polled (see poll()).
+    // Another copy of the mod, or another program, can change a pad's file.
     cx.spawn(async (cx) => {
       await ensureDir();
       for (;;) {
         const paths = await watchFolder(dir());
-        if (this.space && !whereIs(this.space).machine &&
-            paths.some((p) => p === dir() || p === fileFor(this.space))) this.refresh(cx);
+        if (this.space && paths.some((p) => p === dir() || p === fileFor(this.space))) this.refresh(cx);
       }
-    });
-  }
-
-  // A remote pad is re-read every few seconds, but only while the panel shows it.
-  // Hidden copies keep their timers, so the timer stops itself once it isn't
-  // needed, and render() starts it again.
-  wantsPoll() {
-    return !checking() && !!this.space && !!whereIs(this.space).machine && panelShown();
-  }
-
-  poll(cx) {
-    if (this.pollTask || !this.wantsPoll()) return;
-    this.pollTask = cx.timer.every(POLL_MS, (cx) => {
-      if (!this.wantsPoll()) {
-        this.pollTask?.cancel();
-        this.pollTask = null;
-        return;
-      }
-      this.refresh(cx);
     });
   }
 
   // Re-reads the shown pad's file and shows it, unless there are unsaved edits.
-  // A remote file is only read when its fingerprint has changed.
   refresh(cx) {
     const space = this.space;
     if (!space || this.refreshing || !isClean(space)) return;
     this.refreshing = true;
     cx.spawn(async (cx) => {
       try {
-        const { machine, id } = whereIs(space);
-        const stamp = machine ? await remoteStamp(machine, id) : null;
-        if (machine && stamp === stamps.get(space)) return;
         const text = await readPad(space);
-        // Taken before the read: a write in between just means one more read next time.
-        if (machine) stamps.set(space, stamp);
         if (text === synced.get(space) || !isClean(space)) return;
         texts.set(space, text);
         synced.set(space, text);
-        if (this.space === space) {
-          this.unreachable = null;
-          this.show(text);
-        }
+        if (this.space === space) this.show(text);
         cx.notify();
       } catch {
-        // Unreachable for now; keep showing what we have.
+        // Keep showing what we have.
       } finally {
         this.refreshing = false;
       }
@@ -453,14 +397,12 @@ class Pad {
     }
     // Until it loads, show nothing rather than the last space's text.
     this.show("");
-    this.unreachable = null;
     cx.spawn(async (cx) => {
       try {
         const text = await loadText(space);
         if (this.space === space) this.show(text);
-      } catch {
-        // The poll keeps retrying; until then edits aren't kept.
-        if (this.space === space) this.unreachable = whereIs(space).machine ?? "this computer";
+      } catch (err) {
+        if (this.space === space) state.saveError = `Couldn't read the pad: ${err?.message ?? err}`;
       }
       cx.notify();
     });
@@ -486,7 +428,111 @@ class Pad {
 
   snapshot() {
     const range = this.editor.selected_range();
-    return { value: this.editor.value(), start: Math.min(range.start, range.end), end: Math.max(range.start, range.end) };
+    return { value: this.editor.value(), start: Math.min(range.start, range.end), end: Math.max(range.start, range.end), space: this.space, tab: focused()?.tab };
+  }
+
+  addImages(paths, cx) {
+    if (checking() || !this.space || !texts.has(this.space) || this.addingImages) return;
+    const space = this.space;
+    this.addingImages = true;
+    cx.spawn(async (cx) => {
+      let tmp;
+      try {
+        await ensureDir();
+        tmp = (await sh('umask 077; mktemp -d "$1/.capture-XXXXXX"', dir())).trim();
+        for (const [index, path] of paths.entries()) {
+          const name = await clipboard("capture", path ?? "", tmp);
+          if (!imageName.test(name)) throw new Error("Invalid image name.");
+          const relative = `${imageFolder(space)}/${name}`;
+          // In place before the reference shows, so its thumbnail loads.
+          incoming.add(relative);
+          await sh('mkdir -p "$(dirname "$2")" && mv -f "$1" "$2"', `${tmp}/${name}`, `${dir()}/${relative}`);
+          if (this.space !== space) break;  // the next save or sweep removes it
+          const { value, start, end } = this.snapshot();
+          const reference = `![image](${relative})`;
+          this.editor.set_value(value.slice(0, start) + reference + value.slice(end));
+          const next = start + reference.length;
+          this.editor.set_selected_range({ start: index === paths.length - 1 ? start : next, end: next });
+          this.changed(cx);
+          this.checkSelection(cx);
+        }
+      } catch (err) {
+        this.status = `Image not added: ${err?.message ?? err}`;
+      } finally {
+        incoming.clear();
+        try {
+          if (tmp) await sh('rm -rf "$1"', tmp);
+        } finally {
+          this.addingImages = false;
+          cx.notify();
+        }
+      }
+    });
+  }
+
+  // Selects an image's reference, so Send pastes that image.
+  selectImage(ref, cx) {
+    this.editor.set_selected_range({ start: ref.start, end: ref.end });
+    this.focus();
+    this.checkSelection(cx);
+  }
+
+  // Deletes the reference (and its line, if that's all it held); the save removes the file.
+  removeImage(ref, cx) {
+    const value = this.editor.value();
+    const { start } = ref;
+    let { end } = ref;
+    if ((start === 0 || value[start - 1] === "\n") && value[end] === "\n") end++;
+    this.hoveredThumb = null;
+    this.editor.set_value(value.slice(0, start) + value.slice(end));
+    this.editor.set_selected_range({ start, end: start });
+    this.changed(cx);
+    this.checkSelection(cx);
+    cx.notify();
+  }
+
+  preview(ref) {
+    openOverlay({
+      mod: MOD, kind: "dialog", width: 0.8, height: 0.8,
+      props: { role: "preview", image: `data/${MOD}/${ref.path}` },
+    });
+  }
+
+  // The pad's images under the text. Click one to select it and see it larger;
+  // its × removes it.
+  thumbnails(t) {
+    const refs = this.space ? imageRefs(this.editor.value(), this.space) : [];
+    if (!refs.length) return null;
+    return h_flex()
+      .id("scratchpad-thumbs").flex_none().max_h(150).overflow_y_scroll().flex_wrap()
+      .gap(6).px(14).py(8).border_t(1).border_color(t.border)
+      .children(refs.map((ref, i) => div()
+        .id(`scratchpad-thumb-${i}`)
+        .relative().size(64).flex_none().rounded(6).overflow_hidden().cursor_pointer()
+        .border_1().border_color(t.border).bg(t.raised)
+        .hover((s) => s.border_color(t.accent))
+        .on_hover((hovered, cx) => {
+          if (hovered) this.hoveredThumb = i;
+          else if (this.hoveredThumb === i) this.hoveredThumb = null;
+          cx.notify();
+        })
+        .on_click((_e, cx) => {
+          this.selectImage(ref, cx);
+          this.preview(ref);
+        })
+        .child(image(`data/${MOD}/${ref.path}`).size_full())
+        .when(this.hoveredThumb === i, (el) => el.child(
+          h_flex()
+            .id(`scratchpad-thumb-remove-${i}`)
+            .absolute().top(3).right(3).size(18).rounded(9).items_center().justify_center()
+            .bg(t.background).border_1().border_color(t.border)
+            .text_size(12).text_color(t.foreground).cursor_pointer()
+            .hover((s) => s.bg(t.hover))
+            .on_click((_e, cx) => {
+              cx.stop_propagation();
+              this.removeImage(ref, cx);
+            })
+            .child("×")))));
   }
 
   onModifiers(e, cx) {
@@ -572,14 +618,23 @@ class Pad {
   }
 
   // Reads the pad, never writes it: a failed send leaves the text as it was.
-  async send({ value, start, end }, cx) {
+  async send({ value, start, end, space = this.space, tab = focused()?.tab }, cx) {
     const text = value.slice(start, end);
     if (!text.trim()) return "Highlight the text you want to send.";
 
-    const tab = focused()?.tab;
     const target = tab && lastTerminal.get(tab);
     if (!target) return "No terminal to send to yet: click one first.";
-    await pasteInto(target, text, cx);
+    const parts = [];
+    let offset = start;
+    for (const ref of imageRefs(value, space)) {
+      if (ref.end <= start || ref.start >= end) continue;
+      if (ref.start < start || ref.end > end) return "Highlight the entire image reference to send it.";
+      if (ref.start > offset) parts.push({ text: value.slice(offset, ref.start) });
+      parts.push({ image: ref.path });
+      offset = ref.end;
+    }
+    if (offset < end) parts.push({ text: value.slice(offset, end) });
+    await pasteInto(target, parts, cx);
     return null;
   }
 
@@ -590,34 +645,33 @@ class Pad {
       .absolute().inset_0().px(24).gap(6)
       .items_center().justify_center().text_center()
       .text_size(12).text_color(t.dim)
-      .child(div().text_color(t.muted).child("Scratch notes for this space."))
-      .child(line("Highlight text, then ⌘↵ or Send to paste it into your last terminal."))
-      .child(line("⌘⇧J opens and closes this panel."))
-      .child(line("Saved on the space's machine; cleared when the space closes."));
+      .child(div().text_color(t.muted).child("Notes for this space"))
+      .child(line("Highlight text, then ⌘↵ to send"))
+      .child(line("Paste or drop images"))
+      .child(line("⌘⇧J to toggle"));
   }
 
   render(cx) {
     this.follow(cx);
-    this.poll(cx);
     if (state.wantFocus && panelShown()) {
       state.wantFocus = false;
       this.focus();
     }
     const t = theme();
+    const thumbs = this.thumbnails(t);
     return v_flex()
       .id("scratchpad")
       .key_context("ScratchPad")
       .on_action(SEND, (_e, cx) => this.trySend(cx, this.snapshot()))
       .on_modifiers_changed((e, cx) => this.onModifiers(e, cx))
+      .on_drop((e, cx) => this.addImages(e.paths ?? [], cx))
       .size_full().min_h(0).rounded(10).overflow_hidden()
       .bg(t.background).border_1().border_color(t.border)
       .text_color(t.foreground).text_size(13)
       .child(
         h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
           .child(div().font_semibold().child("Scratch Pad"))
-          .when(!!this.unreachable, (el) => el.child(
-            div().text_size(11).text_color(t.dim).child(`Can't reach ${this.unreachable}: edits won't be saved`)))
-          .when(!this.unreachable && !!state.saveError, (el) => el.child(
+          .when(!!state.saveError, (el) => el.child(
             div().text_size(11).text_color(t.dim).truncate().child(state.saveError))),
       )
       .child(
@@ -628,6 +682,7 @@ class Pad {
           .child(Editor.new(this.editor))
           .when(this.empty, (el) => el.child(this.hint(t))),
       )
+      .when(!!thumbs, (el) => el.child(thumbs))
       .child(
         h_flex().flex_none().px(14).py(8).gap(8).items_center().justify_between()
           .border_t(1).border_color(t.border).text_size(11)
@@ -657,9 +712,25 @@ class Pad {
   }
 }
 
+// A pad image, large, in a dialog. Click or Esc closes it.
+class Preview {
+  init() {}
+
+  render() {
+    const t = theme();
+    const p = props();
+    return div()
+      .id("scratchpad-preview")
+      .size_full().p(12).bg(t.background).cursor_pointer()
+      .on_click(() => closeOverlay(p.overlay))
+      .child(image(p.image).size_full());
+  }
+}
+
 export default class Scratchpad extends View {
   init(p, cx) {
-    this.role = (props() ?? p)?.role === "button" ? new Button() : new Pad();
+    const role = (props() ?? p)?.role;
+    this.role = role === "button" ? new Button() : role === "preview" ? new Preview() : new Pad();
     this.role.init(cx);
   }
 

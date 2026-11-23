@@ -4,7 +4,7 @@ Mods for [Herdr](https://herdr.dev).
 
 ## Scratch Pad
 
-A markdown notepad for each Herdr space, in a panel beside your terminals. Jot notes or draft a prompt, highlight part of it, and press ⌘↵ to paste it into the last terminal you used. It pastes without pressing Enter, so you can review before sending.
+A markdown notepad for each Herdr space, in a panel beside your terminals. Jot notes, add screenshots or draft a prompt, highlight part of it, and press ⌘↵ to paste it into the last terminal you used. It pastes without pressing Enter, so you can review before sending.
 
 ![Scratch Pad](scratchpad/preview.png)
 
@@ -30,24 +30,27 @@ To update, run `git pull` in the clone and then run the install command again.
 
 | Key | Does |
 | --- | --- |
-| ⌘⇧J (or the **Pad** button) | Open the pad, focus it, or close it and return to your terminal |
-| ⌘↵ (or **Send**) | Paste the highlighted text into the last terminal you focused in this tab |
+| ⌘⇧J | Open the pad, focus it, or close it and return to your terminal |
+| **Pad** button | Open or close the pad |
+| ⌘↵ (or **Send**) | Paste the highlighted text and images into the last terminal you focused in this tab |
+| ⌘V or image-file drop | Add an image at the pad's selection as a markdown image reference |
 
 - **One pad per space.** Switching spaces switches pads, and each space remembers whether its pad was open.
 - **Saved as you type.** Pads survive restarts and are deleted when their space closes.
-- **Shared across machines.** A pad is saved on the machine its space runs on, in that machine's `~/.config/herdr-app/data/scratchpad/`. If two computers connect to the same machine, both see the same pad, and edits from one show up on the other within a few seconds. If both edit at the same moment, the last save wins.
-- **Clipboard:** sending goes through the clipboard and puts your previous clipboard text back afterwards. Images and files on the clipboard aren't restored.
+- **Kept on this computer.** Every pad is saved in `~/.config/herdr-app/data/scratchpad/` here, including pads for spaces on other machines, so they work while those machines are offline. Pads aren't shared with other computers. Sending to a remote terminal works the same way: Herdr copies images over and pastes their path.
+- **Images:** pasted screenshots and dropped image files are converted to PNG (up to 10 MiB) and saved in `<space>.images/` next to the pad. They show as thumbnails under the text: click one to select it and see it larger, or hover and click × to remove it. Highlight the entire `![image](...)` reference to send the image; select surrounding text too to paste both in order. Deleting a reference deletes its image after the pad saves (unless another reference still uses it). Closing the space deletes its images too.
+- **Clipboard:** sending restores the previous clipboard, including images and file references. If you copy something during a send, it stops rather than overwriting your new clipboard.
+- **Agent support:** images use the terminal's normal image-paste behavior, without pressing Enter. The target agent must accept image pastes; there is no automatic file-path fallback.
 
 ### Requirements
 
-- macOS: sending uses `pbcopy` and `pbpaste`, and the keys are ⌘-based.
+- macOS: image capture and sending use `osascript` with AppKit, and the keys are ⌘-based.
 - `herdr-app` on your `PATH`, plus `python3` and `rsync` for the installer.
 - A layout with Herdr's `tabs` mod and a block that shows the active tab, as `main` has.
-- For remote spaces, a POSIX `sh` on the remote machine.
 
 ### What it accesses
 
-The mod runs `sh`, `pbcopy` and `pbpaste` on this computer. For remote spaces it runs `sh` on that machine to read and write pad files. It only reads and writes files in Herdr's `data/scratchpad/` folder, and it makes no network requests of its own.
+The mod runs `sh` and `osascript` on this computer, and nothing on remote machines. It reads pasted image bytes or image files you drop into the pad. Stored files and private, temporary clipboard snapshots stay in Herdr's `data/scratchpad/` folder. It makes no network requests of its own.
 
 ## Building your own
 
