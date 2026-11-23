@@ -95,6 +95,3 @@ A markdown scratch pad for each Herdr space, in a panel that slides in to the ri
 - For a space on another machine, the pad's file is in this computer's `~/.config/herdr-app/data/scratchpad/`, and sending an image to a terminal there pastes a path to a copy on that machine.
 - Dragging the panel's edge to a new width, closing it and reopening it keeps that width.
 
----
-
-Created using Anthropic Claude. Keep this to internal versions until a person has reviewed and verified it.
