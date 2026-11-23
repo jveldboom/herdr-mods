@@ -18,6 +18,10 @@ that can paste selected text and images into the last focused terminal.
   `.bak` backup).
 - `.github/workflows/release.yaml`: makes a GitHub release on every push to
   `main`, versioned from Conventional Commits.
+- `tools/preview/`: `render.py` builds `mods/<name>/preview.png` from
+  `mods/<name>/preview/preview.json` and a screenshot, using the shared
+  `template.html`. Never edit a `preview.png` directly; change the JSON,
+  screenshot or template and re-render (see "Preview images" in `README.md`).
 - `mods/<name>/README.md`: the mod's user docs (use, requirements, access).
 - `mods/scratchpad/RECIPE.md`: detailed behavior, implementation notes,
   pitfalls, and the acceptance checklist. Read this before changing the mod.
@@ -31,7 +35,8 @@ that can paste selected text and images into the last focused terminal.
 ## Adding a mod
 
 Create `mods/<name>/src/` with `mod.json` and code, plus a `README.md`.
-Optionally add `keys.json` and `hooks/install.sh`. Add the mod to the
+Optionally add `keys.json` and `hooks/install.sh`. Add `preview/preview.json`
+and a screenshot, then run `tools/preview/render.py mods/<name>`. Add the mod to the
 table in the root `README.md`.
 
 ## Project constraints
