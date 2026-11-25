@@ -218,11 +218,12 @@ async function readBase(space) {
 // Both copies hold `text`; the other one is at `stamp`.
 async function agree(space, text, stamp) {
   stamps.set(space, stamp);
+  if (bases.get(space) !== text) {
+    await ensureDir();
+    await fs.writeFile(baseFor(space), text);
+    bases.set(space, text);
+  }
   unpushed.delete(space);
-  if (bases.get(space) === text) return;
-  await ensureDir();
-  await fs.writeFile(baseFor(space), text);
-  bases.set(space, text);
 }
 
 // Brings a remote space's saved pad and the copy on its machine into agreement:
@@ -279,7 +280,8 @@ async function syncRemote(space) {
       return false;
     }
   }
-  return true;
+  syncErrors.set(space, `Not synced with ${machine}: its copy kept changing.`);
+  return false;
 }
 
 // True when the pad has no edits that haven't been saved yet.
@@ -296,16 +298,13 @@ async function sweep(live, ready) {
     const space = decodeURIComponent(name.slice(0, -suffix.length));
     const machine = machineOf(space);
     if (live.has(space) || !ready.has(machine)) continue;
-    if (suffix === ".base") {
-      try {
-        await removeRemote(machine, encodeURIComponent(space.slice(machine.length + 1)));
-      } catch {
-        continue;
-      }
-    }
-    for (const map of [texts, synced, bases, stamps, lastPoll, syncErrors, merged]) map.delete(space);
-    unpushed.delete(space);
-    await sh('rm -rf "$1"', `${dir()}/${name}`);
+    // Queued behind any save or sync of the pad, which then sees the space is gone.
+    await serial(space, async () => {
+      if (suffix === ".base") await removeRemote(machine, encodeURIComponent(space.slice(machine.length + 1)));
+      for (const map of [texts, synced, bases, stamps, lastPoll, syncErrors, merged]) map.delete(space);
+      unpushed.delete(space);
+      await sh('rm -rf "$1"', `${dir()}/${name}`);
+    }).catch(() => {});
   }
 }
 

@@ -60,6 +60,7 @@ export async function writeRemote(machine, id, text, expected) {
       const out = await sh(machine, `t="$3"
 if [ -z "$t" ]; then mkdir -p "$d"; t=$(mktemp "$f.XXXXXX"); fi
 case "$t" in "$f".*) ;; *) exit 2 ;; esac
+trap '[ $? -eq 0 ] || rm -f "$t"' EXIT
 printf %s "$4" >> "$t"
 if [ -z "$5" ]; then echo "$t"; exit 0; fi
 if [ "$(st "$f")" != "$2" ]; then rm -f "$t"; exit 3; fi
