@@ -8,18 +8,20 @@
 //     space's text and handles `scratchpad.send`.
 //
 // Every pad is stored on this computer, in <Herdr home>/data/scratchpad/<space>.md,
-// with its images in <space>.images/. Pads and images for remote spaces stay here
-// too; sending pastes them into the terminal, and Herdr copies images over.
-// Deleted when the space closes.
+// with its images in <space>.images/. A remote space's text is also kept in step
+// with the copy on its machine (sync.js), so every computer connected to that
+// machine shares it; images stay on the computer that added them. Sending pastes
+// into the terminal, and Herdr copies images over. Deleted when the space closes.
 
 import { View, div, image, svg } from "gpui-kit";
 import { Editor, EditorState, h_flex, v_flex } from "gpui-base";
 import {
   appHome, checking, closeOverlay, exec, focused, layout, machines, nextCommand, openOverlay, props,
-  run, settings, spaces, theme, watchFolder,
+  run, settings, spaces, theme, watchFolder, window as appWindow, writeTextFile,
 } from "herdr";
 import * as fs from "fs/promises";
 import { clipboard } from "./clipboard.js";
+import { Stale, readRemote, removeRemote, writeRemote } from "./sync.js";
 
 const MOD = "scratchpad";
 const PANEL = "scratchpad-panel";
@@ -27,18 +29,27 @@ const ICON = `mods/${MOD}/pad.svg`;
 const SEND = "scratchpad_send";
 const dir = () => `${appHome()}/data/${MOD}`;
 const fileFor = (space) => `${dir()}/${encodeURIComponent(space)}.md`;
+const baseFor = (space) => `${dir()}/${encodeURIComponent(space)}.base`;
 const imageFolder = (space) => `${encodeURIComponent(space)}.images`;
 const imageName = /^[a-f0-9]{32}\.png$/;
 const incoming = new Set();  // images moved into place but not referenced yet
 let sending = false;
 
-// The pad's own image references, in order, as ranges of the text.
+// Remote pads are checked only while one is shown, the window is visible and
+// its machine is connected: this often while the window is focused, less when not.
+const POLL_MS = 3000;
+const POLL_IDLE_MS = 15000;
+const POLL_MAX_MS = 60000;  // after failures
+
+// The pad's image references, in order, as ranges of the text. `here` is false
+// for images another computer added: synced text can name images it doesn't have.
 function imageRefs(text, space) {
   const refs = [];
-  const prefix = `${imageFolder(space)}/`;
-  for (const match of text.matchAll(/!\[[^\]\n]*\]\(([^)\n]+)\)/g)) {
-    if (match[1].startsWith(prefix) && imageName.test(match[1].slice(prefix.length)))
-      refs.push({ path: match[1], start: match.index, end: match.index + match[0].length });
+  for (const match of text.matchAll(/!\[[^\]\n]*\]\(([^)\n/]+\.images)\/([a-f0-9]{32}\.png)\)/g)) {
+    refs.push({
+      path: `${match[1]}/${match[2]}`, here: match[1] === imageFolder(space),
+      start: match.index, end: match.index + match[0].length,
+    });
   }
   return refs;
 }
@@ -46,6 +57,12 @@ function imageRefs(text, space) {
 // Shared by every copy of this mod.
 const texts = new Map();         // space id -> pad text
 const synced = new Map();        // space id -> text last read from or written to its file
+const bases = new Map();         // remote space id -> text both copies last agreed on, or null
+const stamps = new Map();        // remote space id -> the other copy's stamp when it held that text
+const lastPoll = new Map();      // remote space id -> when its machine was last asked
+const unpushed = new Set();      // remote space ids saved here but not yet on their machine
+const syncErrors = new Map();    // remote space id -> why it isn't synced, for the header
+const merged = new Map();        // space id -> notice that the pad now holds two versions
 const lastTerminal = new Map();  // tab id -> last focused terminal address
 const state = { padFocused: false, wantFocus: false, pad: null, saveError: null };
 
@@ -66,6 +83,15 @@ const panelShown = () => {
 
 // "vps/sp12" is space "sp12" on machine "vps"; a bare id is on this computer.
 const machineOf = (space) => (space.includes("/") ? space.slice(0, space.indexOf("/")) : "");
+const isReady = (machine) => machines().some((m) => (m.name ?? "") === machine && m.layout === "ready");
+
+// One save or sync at a time per pad, in order.
+const chains = new Map();
+function serial(space, job) {
+  const next = (chains.get(space) ?? Promise.resolve()).catch(() => {}).then(job);
+  chains.set(space, next);
+  return next;
+}
 
 async function sh(script, ...args) {
   const r = await exec("sh", ["-c", script, "sh", ...args], { timeout: 15000 });
@@ -83,10 +109,50 @@ async function readPad(space) {
   return (await fs.exists(path)) ? await fs.readFile(path, "utf8") : "";
 }
 
-async function writePad(space, text) {
+// Replaces the pad's file only if it still holds `expected`; throws Stale when
+// something else (another computer, for this machine's spaces) changed it.
+async function writePad(space, text, expected) {
   await ensureDir();
-  if (text !== "") await fs.writeFile(fileFor(space), text);
-  else if (await fs.exists(fileFor(space))) await fs.unlink(fileFor(space));
+  const path = fileFor(space);
+  const exists = await fs.exists(path);
+  if (!exists && expected !== "") throw new Stale();
+  if (text === "") {
+    if (exists && (await readPad(space)) !== expected) throw new Stale();
+    if (exists) await fs.unlink(path);
+    return;
+  }
+  try {
+    await writeTextFile(path, text, exists ? expected : null);
+  } catch (err) {
+    if ((await readPad(space)) !== expected) throw new Stale();
+    throw err;
+  }
+}
+
+// Two versions edited at once: keep both, mine first.
+function merge(mine, theirs, from) {
+  if (!mine.trim()) return theirs;
+  if (!theirs.trim()) return mine;
+  return `${mine.replace(/\s+$/, "")}\n\n---\n\nAlso edited on ${from}:\n\n${theirs}`;
+}
+
+// Puts `next` in place of the pad's text, then saves it over `expected`. Callers
+// check there are no edits that `next` leaves out. It shows first, so typing
+// during the write builds on it. If the save fails, the pad shows `fallback`.
+async function take(space, next, { expected = synced.get(space), fallback = expected } = {}) {
+  texts.set(space, next);
+  if (state.pad?.space === space) state.pad.show(next);
+  try {
+    await writePad(space, next, expected);
+  } catch (err) {
+    if (texts.get(space) === next) {
+      texts.set(space, fallback);
+      if (state.pad?.space === space) state.pad.show(fallback);
+    }
+    throw err;
+  }
+  synced.set(space, next);
+  await removeImages(space).catch(() => {});
 }
 
 // Deletes the space's images that its latest text no longer references.
@@ -112,9 +178,19 @@ async function loadText(space) {
 
 async function saveText(space, text) {
   if (!spaces().some((s) => s.id === space)) return;  // closed: sweep() has its files
+  if (texts.get(space) !== text) return;  // newer edits have their own save coming
   try {
-    await writePad(space, text);
-    synced.set(space, text);
+    try {
+      await writePad(space, text, synced.get(space) ?? "");
+      synced.set(space, text);
+    } catch (err) {
+      if (!(err instanceof Stale)) throw err;
+      // Another computer saved this pad since it was read here.
+      const theirs = await readPad(space);
+      if (texts.get(space) !== text) return;
+      await take(space, merge(text, theirs, "another computer"), { expected: theirs, fallback: text });
+      merged.set(space, "Edited here and on another computer at once: both versions are in the pad.");
+    }
     state.saveError = null;
   } catch (err) {
     state.saveError = `Not saved: ${err?.message ?? err}`;
@@ -125,21 +201,110 @@ async function saveText(space, text) {
   } catch (err) {
     state.saveError = `Saved, but image cleanup failed: ${err?.message ?? err}`;
   }
+  if (machineOf(space)) {
+    unpushed.add(space);
+    await syncRemote(space);
+  }
+}
+
+async function readBase(space) {
+  if (!bases.has(space)) {
+    const path = baseFor(space);
+    bases.set(space, (await fs.exists(path)) ? await fs.readFile(path, "utf8") : null);
+  }
+  return bases.get(space);
+}
+
+// Both copies hold `text`; the other one is at `stamp`.
+async function agree(space, text, stamp) {
+  stamps.set(space, stamp);
+  unpushed.delete(space);
+  if (bases.get(space) === text) return;
+  await ensureDir();
+  await fs.writeFile(baseFor(space), text);
+  bases.set(space, text);
+}
+
+// Brings a remote space's saved pad and the copy on its machine into agreement:
+// whichever changed since they last agreed wins, and if both did, the pad keeps
+// both. Edits that aren't saved yet are left for their save, which calls this.
+// Run it through serial(). Returns false when the machine couldn't be reached.
+async function syncRemote(space) {
+  const machine = machineOf(space);
+  const id = encodeURIComponent(space.slice(machine.length + 1));
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (!spaces().some((s) => s.id === space)) return true;
+    if (!isReady(machine)) {
+      if (unpushed.has(space)) syncErrors.set(space, `Not synced: ${machine} isn't connected.`);
+      return false;
+    }
+    try {
+      await loadText(space);
+      if (!isClean(space)) return true;
+      const mine = synced.get(space);
+      const base = await readBase(space);
+      const known = base === null ? undefined : stamps.get(space);
+      let stamp;
+      if (known !== undefined && mine !== base) {
+        // Saved here since they agreed: one exec, unless the other copy changed too.
+        stamp = await writeRemote(machine, id, mine, known);
+        await agree(space, mine, stamp);
+      } else {
+        const remote = await readRemote(machine, id, known);
+        const theirs = remote.text ?? base;
+        stamp = remote.stamp;
+        if (!isClean(space) || synced.get(space) !== mine) return true;
+        if (theirs === mine) {
+          await agree(space, mine, stamp);
+        } else if (base === null ? theirs === "" : theirs === base) {
+          await agree(space, mine, await writeRemote(machine, id, mine, stamp));
+        } else if (base === null ? mine === "" : mine === base) {
+          await take(space, theirs);
+          await agree(space, theirs, stamp);
+        } else {
+          const both = merge(mine, theirs, machine);
+          await take(space, both);
+          merged.set(space, `Edited here and on ${machine} at once: both versions are in the pad.`);
+          await agree(space, both, await writeRemote(machine, id, both, stamp));
+        }
+      }
+      syncErrors.delete(space);
+      return true;
+    } catch (err) {
+      if (err instanceof Stale) {
+        stamps.delete(space);
+        continue;
+      }
+      syncErrors.set(space, `Not synced with ${machine}: ${err?.message ?? err}`);
+      return false;
+    }
+  }
+  return true;
 }
 
 // True when the pad has no edits that haven't been saved yet.
 const isClean = (space) => !texts.has(space) || texts.get(space) === synced.get(space);
 
-// Deletes pads and images whose space has closed on a machine that reports its spaces.
+// Deletes pads and images whose space has closed on a machine that reports its
+// spaces. A synced pad (it has a .base) is deleted on its machine too; its .base
+// stays until that works, so a later sweep tries again.
 async function sweep(live, ready) {
   if (!(await fs.exists(dir()))) return;
   for (const name of await fs.readdir(dir())) {
-    const suffix = name.endsWith(".md") ? ".md" : name.endsWith(".images") ? ".images" : null;
+    const suffix = [".md", ".images", ".base"].find((s) => name.endsWith(s));
     if (!suffix) continue;
     const space = decodeURIComponent(name.slice(0, -suffix.length));
-    if (live.has(space) || !ready.has(machineOf(space))) continue;
-    texts.delete(space);
-    synced.delete(space);
+    const machine = machineOf(space);
+    if (live.has(space) || !ready.has(machine)) continue;
+    if (suffix === ".base") {
+      try {
+        await removeRemote(machine, encodeURIComponent(space.slice(machine.length + 1)));
+      } catch {
+        continue;
+      }
+    }
+    for (const map of [texts, synced, bases, stamps, lastPoll, syncErrors, merged]) map.delete(space);
+    unpushed.delete(space);
     await sh('rm -rf "$1"', `${dir()}/${name}`);
   }
 }
@@ -258,6 +423,10 @@ class Button {
     const key = spaces().map((s) => s.id).sort().join("\n") + "|" + [...ready].sort().join(",");
     if (key === this.knownSpaces || checking()) return;
     this.knownSpaces = key;
+    // Saves that couldn't reach their machine go over once it's back.
+    for (const space of unpushed) {
+      if (ready.has(machineOf(space))) cx.spawn(async () => serial(space, () => syncRemote(space)).catch(() => {}));
+    }
     const live = new Set(spaces().map((s) => s.id));
     // A machine with no spaces yet may still be loading: leave its pads alone.
     // Once it has listed spaces, an empty list means its last space closed.
@@ -308,6 +477,9 @@ class Pad {
     this.armed = null;  // text and selection when Cmd went down
     this.hasSelection = false;
     this.empty = true;
+    this.pollTask = null;
+    this.polling = false;
+    this.failures = 0;
   }
 
   init(cx) {
@@ -380,6 +552,37 @@ class Pad {
     });
   }
 
+  // The machine to ask for changes to the shown pad, or null when it shouldn't be asked.
+  pollMachine() {
+    const machine = this.space ? machineOf(this.space) : "";
+    if (!machine || checking() || !panelShown() || !appWindow()?.visible || !isReady(machine)) return null;
+    return machine;
+  }
+
+  // Called on every render. A hidden or minimized pad lets its timer lapse, and
+  // the next render starts it again.
+  schedulePoll(cx) {
+    if (this.polling || !this.pollMachine()) return;
+    const every = Math.min(POLL_MAX_MS, (appWindow()?.active ? POLL_MS : POLL_IDLE_MS) * 2 ** Math.min(this.failures, 4));
+    const due = (lastPoll.get(this.space) ?? 0) + every;
+    if (this.pollTask && this.pollDue <= due) return;
+    this.pollTask?.cancel();
+    this.pollDue = due;
+    this.pollTask = cx.timer.after(Math.max(0, due - Date.now()), (cx) => {
+      this.pollTask = null;
+      if (!this.pollMachine()) return;
+      const space = this.space;
+      this.polling = true;
+      lastPoll.set(space, Date.now());
+      cx.spawn(async (cx) => {
+        const ok = await serial(space, () => syncRemote(space)).catch(() => false);
+        this.failures = ok ? 0 : this.failures + 1;
+        this.polling = false;
+        cx.notify();
+      });
+    });
+  }
+
   focus() {
     this.editor.focus();
   }
@@ -390,6 +593,7 @@ class Pad {
     if (!space || space === this.space) return;
     this.space = space;
     this.status = null;
+    this.failures = 0;
     if (texts.has(space)) {
       this.show(texts.get(space));
       this.refresh(cx);
@@ -399,8 +603,8 @@ class Pad {
     this.show("");
     cx.spawn(async (cx) => {
       try {
-        const text = await loadText(space);
-        if (this.space === space) this.show(text);
+        await loadText(space);
+        if (this.space === space) this.show(texts.get(space));
       } catch (err) {
         if (this.space === space) state.saveError = `Couldn't read the pad: ${err?.message ?? err}`;
       }
@@ -518,9 +722,12 @@ class Pad {
         })
         .on_click((_e, cx) => {
           this.selectImage(ref, cx);
-          this.preview(ref);
+          if (ref.here) this.preview(ref);
         })
-        .child(image(`data/${MOD}/${ref.path}`).size_full())
+        .child(ref.here
+          ? image(`data/${MOD}/${ref.path}`).size_full()
+          : v_flex().size_full().p(4).items_center().justify_center().text_center()
+            .text_size(10).text_color(t.dim).child("On another computer"))
         .when(this.hoveredThumb === i, (el) => el.child(
           h_flex()
             .id(`scratchpad-thumb-remove-${i}`)
@@ -581,8 +788,9 @@ class Pad {
     }
     const space = this.space;
     if (!texts.has(space)) return;  // not loaded yet
-    if (this.status) {
+    if (this.status || merged.has(space)) {
       this.status = null;
+      merged.delete(space);  // they've seen it: they're editing the pad
       cx.notify();
     }
     const empty = this.editor.value() === "";
@@ -595,7 +803,7 @@ class Pad {
     this.saveTask?.cancel();
     this.saveTask = cx.timer.after(400, (cx) => {
       cx.spawn(async (cx) => {
-        await saveText(space, texts.get(space) ?? "");
+        await serial(space, () => saveText(space, texts.get(space) ?? ""));
         cx.notify();
       });
     });
@@ -629,6 +837,7 @@ class Pad {
     for (const ref of imageRefs(value, space)) {
       if (ref.end <= start || ref.start >= end) continue;
       if (ref.start < start || ref.end > end) return "Highlight the entire image reference to send it.";
+      if (!ref.here) return "That image was added on another computer, so it can't be sent from here.";
       if (ref.start > offset) parts.push({ text: value.slice(offset, ref.start) });
       parts.push({ image: ref.path });
       offset = ref.end;
@@ -636,6 +845,10 @@ class Pad {
     if (offset < end) parts.push({ text: value.slice(offset, end) });
     await pasteInto(target, parts, cx);
     return null;
+  }
+
+  headerNote() {
+    return state.saveError ?? syncErrors.get(this.space) ?? merged.get(this.space) ?? null;
   }
 
   // Shown over an empty pad. No mouse handlers, so clicks reach the editor.
@@ -653,6 +866,7 @@ class Pad {
 
   render(cx) {
     this.follow(cx);
+    this.schedulePoll(cx);
     if (state.wantFocus && panelShown()) {
       state.wantFocus = false;
       this.focus();
@@ -671,8 +885,8 @@ class Pad {
       .child(
         h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
           .child(div().font_semibold().child("Scratch Pad"))
-          .when(!!state.saveError, (el) => el.child(
-            div().text_size(11).text_color(t.dim).truncate().child(state.saveError))),
+          .when(!!this.headerNote(), (el) => el.child(
+            div().text_size(11).text_color(t.dim).truncate().child(this.headerNote()))),
       )
       .child(
         div().id("scratchpad-editor").relative().flex_1().min_h(0).p(8)
