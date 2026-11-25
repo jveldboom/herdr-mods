@@ -926,18 +926,47 @@ class Pad {
   }
 }
 
-// A pad image, large, in a dialog. Click or Esc closes it.
+// A pad image in a dialog, at its own size or shrunk to fit. image() fills its
+// box and crops, so the box takes the image's shape. Click or Esc closes it.
 class Preview {
-  init() {}
+  init(cx) {
+    this.natural = null;
+    this.loaded = false;
+    this.box = null;
+    cx.spawn(async (cx) => {
+      try {
+        // Pad images are always PNG: width and height are big-endian at bytes 16 and 20.
+        const b = await fs.readFile(`${appHome()}/${props().image}`);
+        const at = (i) => ((b[i] << 24) | (b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3]) >>> 0;
+        if (b.length >= 24 && at(16) > 0 && at(20) > 0) this.natural = { width: at(16), height: at(20) };
+      } catch {
+        // Shown filling the dialog instead.
+      }
+      this.loaded = true;
+      cx.notify();
+    });
+  }
 
   render() {
     const t = theme();
     const p = props();
-    return div()
+    const pad = 12;
+    let picture = image(p.image).size_full();
+    if (this.natural && this.box) {
+      const { width, height } = this.natural;
+      const scale = Math.min(1, (this.box.width - 2 * pad) / width, (this.box.height - 2 * pad) / height);
+      picture = image(p.image).w(Math.max(1, Math.floor(width * scale))).h(Math.max(1, Math.floor(height * scale)));
+    }
+    return h_flex()
       .id("scratchpad-preview")
-      .size_full().p(12).bg(t.background).cursor_pointer()
+      .size_full().p(pad).items_center().justify_center().bg(t.background).cursor_pointer()
+      .on_size_change((size, cx) => {
+        if (this.box?.width === size.width && this.box?.height === size.height) return;
+        this.box = size;
+        cx.notify();
+      })
       .on_click(() => closeOverlay(p.overlay))
-      .child(image(p.image).size_full());
+      .when(this.loaded && (!this.natural || !!this.box), (el) => el.child(picture));
   }
 }
 
