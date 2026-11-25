@@ -25,8 +25,8 @@ that can paste selected text and images into the last focused terminal.
 - `mods/<name>/README.md`: the mod's user docs (use, requirements, access).
 - `mods/scratchpad/RECIPE.md`: detailed behavior, implementation notes,
   pitfalls, and the acceptance checklist. Read this before changing the mod.
-- `mods/scratchpad/src/`: mod source (`main.js`, `clipboard.js`, `mod.json`,
-  and assets).
+- `mods/scratchpad/src/`: mod source (`main.js`, `clipboard.js`, `sync.js`,
+  `mod.json`, and assets).
 - `mods/scratchpad/keys.json`: key bindings merged during installation.
 - `mods/scratchpad/hooks/`: `install.sh` (layout choice, `--layout`,
   `--clone`, `--remove`) and `layout.py`, which adds the Pad button and panel
@@ -45,7 +45,9 @@ table in the root `README.md`.
   Preserve Herdr-specific behaviors and APIs described in the recipe.
 - Clipboard and image handling use macOS `osascript` with AppKit
   (`clipboard.js`), and the shortcuts are Cmd-based. Pads and images are stored
-  only on this computer; nothing runs on remote machines.
+  on this computer. A remote space's text is also synced with the copy on its
+  machine (`sync.js`); images are never synced. Keep remote checks limited to a
+  shown pad in a visible window (see "Text sync" in the recipe).
 - Keep the installer idempotent and preserve its backup and `--remove`
   behavior when changing layout integration.
 - Validate mod changes with `herdr-app check mods/<name>/src` when
