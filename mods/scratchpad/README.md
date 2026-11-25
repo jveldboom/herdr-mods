@@ -43,6 +43,7 @@ To update, run `git pull` in the clone and then run the install command again.
 
 - macOS: image capture and sending use `osascript` with AppKit, and the keys are ⌘-based.
 - `herdr-app` on your `PATH`, plus `python3` and `rsync` for the installer.
+- For text sync, a remote machine needs only a POSIX `sh` and `stat` (macOS, Linux or BusyBox). The mod doesn't have to be installed there; if it is, that machine's own window shows the same pad.
 - A layout with Herdr's `tabs` mod and a block that shows the active tab, as `main` has.
 
 ## What it accesses

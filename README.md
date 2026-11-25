@@ -6,7 +6,7 @@ Mods for the [Herdr](https://herdr.dev) desktop app. Each mod adds a feature to 
 
 | Mod | What it does |
 | --- | --- |
-| [Scratch Pad](mods/scratchpad/) | A markdown notepad for each space. Highlight text or images and paste them into your last terminal. |
+| [Scratch Pad](mods/scratchpad/) | A markdown notepad for each space. Highlight text or images and paste them into your last terminal. Text syncs across computers that share a remote space. |
 
 ## Install
 
