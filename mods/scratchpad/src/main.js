@@ -643,7 +643,7 @@ class Pad {
       try {
         await ensureDir();
         tmp = (await sh('umask 077; mktemp -d "$1/.capture-XXXXXX"', dir())).trim();
-        for (const [index, path] of paths.entries()) {
+        for (const path of paths) {
           const name = await clipboard("capture", path ?? "", tmp);
           if (!imageName.test(name)) throw new Error("Invalid image name.");
           const relative = `${imageFolder(space)}/${name}`;
@@ -655,7 +655,8 @@ class Pad {
           const reference = `![image](${relative})`;
           this.editor.set_value(value.slice(0, start) + reference + value.slice(end));
           const next = start + reference.length;
-          this.editor.set_selected_range({ start: index === paths.length - 1 ? start : next, end: next });
+          // A cursor, not a selection, so typing doesn't replace the image.
+          this.editor.set_selected_range({ start: next, end: next });
           this.changed(cx);
           this.checkSelection(cx);
         }
